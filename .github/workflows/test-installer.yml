@@ -1,0 +1,112 @@
+# Counter-Strike 1.6 DS: only what testing the installer needs, by hand
+# (Actions > Test installer > Run workflow): the console's program, and the
+# Windows installer with it built in -- not the other systems' (the whole set,
+# release.yml, costs a private repository many of its build minutes).
+name: Test installer
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  rom:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/rom.yml
+
+  windows:
+    needs: rom
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x64, runner: windows-2025, msystem: UCRT64, prefix: mingw-w64-ucrt-x86_64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # The console's program made in this run, built into the converter: a
+      # player needs only the converter, which puts it on the card.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rom
+          path: ${{ runner.temp }}/rom
+
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: >-
+            git
+            zip
+            ${{ matrix.prefix }}-cc
+            ${{ matrix.prefix }}-cmake
+            ${{ matrix.prefix }}-ninja
+            ${{ matrix.prefix }}-qt6-base
+            ${{ matrix.prefix }}-qt6-tools
+
+      - name: Let git read the checkout
+        run: git config --global --add safe.directory "$(pwd)"
+
+      - name: Build ptexconv
+        run: |
+          . docker/versions.env
+          sh docker/fetch.sh "$PTEXCONV_REPO" "$PTEXCONV_COMMIT" ptexconv-src
+          cc -O2 -static ptexconv-src/src/*.c -lm -o ptexconv.exe
+          mkdir -p tools-bin && mv ptexconv.exe tools-bin/
+
+      - name: Build the static command line
+        run: |
+          cmake -S tools/hlds-convert -B build/cli -G Ninja -DCMAKE_BUILD_TYPE=Release -DHLDS_BUNDLED_ROM="$(cygpath -m "$RUNNER_TEMP")/rom/half-life-nds-port.nds" \
+            -DHLDS_BUILD_GUI=OFF -DHLDS_BUILD_TESTS=OFF -DCMAKE_EXE_LINKER_FLAGS=-static
+          cmake --build build/cli --target hlds-convert
+
+      - name: Build the window and the tests
+        run: |
+          cmake -S tools/hlds-convert -B build/convert -G Ninja -DCMAKE_BUILD_TYPE=Release -DHLDS_BUNDLED_ROM="$(cygpath -m "$RUNNER_TEMP")/rom/half-life-nds-port.nds"
+          cmake --build build/convert
+
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          # (Here, not through GITHUB_ENV: an MSYS2 shell drops that PATH.)
+          export PATH="$(pwd)/tools-bin:$PATH"
+          ctest --test-dir build/convert --output-on-failure
+          mkdir -p check/shots check/card check/cache
+          build/convert/gui/hlds-install-check.exe check/shots check/card check/cache
+
+      - name: Package
+        run: |
+          out="dist/CS16-DS-Installer-${{ matrix.name }}"
+          mkdir -p "$out"
+          cp build/convert/gui/hlds-convert-gui.exe build/cli/hlds-convert.exe tools-bin/ptexconv.exe THIRD_PARTY_LICENSES LICENSE-HALF-LIFE-SDK "$out/"
+          windeployqt6 --no-translations --no-opengl-sw "$out/hlds-convert-gui.exe"
+          # What Qt and the compiler stand on, from the MSYS2 system they came from.
+          ldd "$out/hlds-convert-gui.exe" | awk '{print $3}' | grep -iE "^/(ucrt64|clangarm64)/" | sort -u | xargs -I{} cp -n {} "$out/"
+          # The licences of the system's libraries it took along.
+          for dll in "$out"/*.dll; do
+            pacman -Qqo "/$(echo "$MSYSTEM" | tr A-Z a-z)/bin/$(basename "$dll")" 2>/dev/null
+          done | sort -u | while read -r pkg; do
+            printf '\n--- %s, bundled in this package: %s\n' "$pkg" "$(pacman -Qi "$pkg" | sed -n 's/^Licenses *: //p')" >> "$out/THIRD_PARTY_LICENSES"
+            find "/$(echo "$MSYSTEM" | tr A-Z a-z)/share/licenses/$pkg" -type f -exec cat {} + >> "$out/THIRD_PARTY_LICENSES" 2>/dev/null || true
+          done
+          (cd dist && zip -qr "CS16-DS-Installer-${{ matrix.name }}.zip" "CS16-DS-Installer-${{ matrix.name }}")
+          rm -rf "$out"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installer-${{ matrix.name }}
+          if-no-files-found: error
+          path: dist/*
+

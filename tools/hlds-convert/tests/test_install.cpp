@@ -1,0 +1,566 @@
+// The installer's decisions, on folders made up for the purpose.
+
+#include <atomic>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+#include "BundledRom.hpp"
+#include "Install.hpp"
+#include "RomHeader.hpp"
+#include "CsRom.hpp"
+#include <cstring>
+#include <vector>
+
+namespace fs = std::filesystem;
+using namespace hlds::install;
+
+namespace
+{
+    int failures = 0;
+    void check(bool ok, const char *what)
+    {
+        if (!ok)
+        {
+            std::printf("FAIL: %s\n", what);
+            ++failures;
+        }
+    }
+    void put(const fs::path &path, const std::string &text = "x")
+    {
+        fs::create_directories(path.parent_path());
+        std::ofstream(path, std::ios::binary) << text;
+    }
+    std::string read(const fs::path &path)
+    {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+    void makeGame(const fs::path &valve, bool upper = false)
+    {
+        for (const char *map : {"c0a0", "c1a0", "c2a1", "c3a1", "c4a1", "c5a1", "t0a0", "t0a0d", "hldemo1", "hldemo3", "stalkyard"})
+        {
+            std::string file = std::string(map) + ".bsp";
+            if (upper)
+                for (char &c : file)
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            put(valve / (upper ? "MAPS" : "maps") / file);
+        }
+        put(valve / "liblist.gam");
+    }
+
+    void testVdf()
+    {
+        const auto libraries = steamLibraries(R"("libraryfolders"
+{
+    "0"
+    {
+        "path"      "C:\\Program Files (x86)\\Steam"
+        "label"     ""
+    }
+    "1"
+    {
+        "Path"      "/mnt/games/SteamLibrary"
+    }
+})");
+        check(libraries.size() == 2, "two libraries read");
+        check(libraries.size() == 2 && libraries[0] == fs::path("C:\\Program Files (x86)\\Steam"), "backslashes undone");
+        check(libraries.size() == 2 && libraries[1] == fs::path("/mnt/games/SteamLibrary"), "any case of its key");
+        check(steamLibraries("rubbish").empty(), "no libraries in rubbish");
+        check(steamLibraries("\"path\"").empty(), "cut short: none, no crash");
+    }
+
+    void testGame(const fs::path &root)
+    {
+        const fs::path valve = root / "Steam/steamapps/common/Half-Life/valve";
+        makeGame(valve);
+        GameFolder game = checkGame(valve);
+        check(game.ok && game.campaign && game.hazardCourse && game.uplink, "the valve folder recognised");
+        game = checkGame(valve.parent_path());
+        check(game.ok && game.valve.filename() == "valve", "Half-Life/ is taken for its valve/");
+        game = checkGame(valve.parent_path().parent_path());
+        check(game.ok, "common/ too");
+
+        makeGame(root / "odd/VALVE", true);
+        game = checkGame(root / "odd");
+        check(game.ok && game.campaign, "any case of the names");
+
+        check(!checkGame(root / "nowhere").ok, "a folder that is not there");
+        put(root / "other/readme.txt");
+        check(!checkGame(root / "other").ok && !checkGame(root / "other").why.empty(), "another folder, with a reason");
+        put(root / "mod/maps/mymap.bsp");
+        put(root / "mod/liblist.gam");
+        check(!checkGame(root / "mod").ok, "a mod's maps are not Half-Life");
+
+        put(root / "partial/maps/t0a0.bsp");
+        put(root / "partial/maps/t0a0d.bsp");
+        put(root / "partial/liblist.gam");
+        game = checkGame(root / "partial");
+        check(game.ok && !game.campaign && game.hazardCourse, "what is there, of what is not whole");
+    }
+
+    void testFind(const fs::path &root)
+    {
+        // Steam here, its game in a library elsewhere.
+        put(root / "s1/steamapps/libraryfolders.vdf",
+            "\"path\" \"" + (root / "lib").generic_string() + "\"");
+        makeGame(root / "lib/steamapps/common/Half-Life/valve");
+        // ... and a part of one, found first but worth less.
+        put(root / "s0/steamapps/common/Half-Life/valve/maps/t0a0.bsp");
+        put(root / "s0/steamapps/common/Half-Life/valve/maps/t0a0d.bsp");
+        put(root / "s0/steamapps/common/Half-Life/valve/liblist.gam");
+        const auto found = findGames({root / "s0", root / "s1", root / "s1"}, {root / "lib/steamapps/common/Half-Life"});
+        check(found.size() == 2, "each once");
+        check(!found.empty() && found[0].campaign, "the most complete first");
+        check(findGames({root / "none"}, {}).empty(), "none found");
+    }
+
+    void testVolumes()
+    {
+        const std::uint64_t needed = 700;
+        Volume card;
+        card.root = "/media/sd";
+        card.format = "vfat";
+        card.removable = true;
+        card.free = 4000;
+        Volume system = card;
+        system.root = "/";
+        system.system = true;
+        system.format = "ext4";
+        Volume windows = card;
+        windows.root = "C:/";
+        windows.system = true;
+        windows.format = "FAT32";
+        Volume data = card;
+        data.root = "/mnt/data";
+        data.removable = false;
+        Volume ntfs = card;
+        ntfs.root = "/media/usb";
+        ntfs.format = "ntfs";
+        Volume ro = card;
+        ro.root = "/media/ro";
+        ro.readOnly = true;
+        Volume full = card;
+        full.root = "/media/full";
+        full.free = 10;
+        Volume usedCard = card;
+        usedCard.root = "/media/ds";
+        usedCard.hasNds = true;
+        usedCard.hasTwilight = true;
+        Volume exfat = card;
+        exfat.root = "/media/ex";
+        exfat.format = "exfat";
+
+        check(scoreVolume(system, needed) < 0, "the system disk is never picked");
+        check(scoreVolume(windows, needed) < 0, "... even in the right format");
+        check(scoreVolume(data, needed) < 0, "nor a fixed data disk");
+        check(scoreVolume(ntfs, needed) >= 0, "any format may be picked");
+        check(scoreVolume(ro, needed) < 0, "nor what cannot be written");
+        const auto ranked = rankVolumes({system, data, full, exfat, card, usedCard, ntfs}, needed);
+        check(ranked.size() == 5, "those fit to offer");
+        check(!ranked.empty() && ranked[0].root == usedCard.root, "a card already used in a console first");
+        check(ranked.size() == 5 && ranked[1].root == card.root, "then a plain card");
+        check(ranked.size() == 5 && ranked[2].root == exfat.root, "then exFAT");
+        check(ranked.size() == 5 && ranked[3].root == ntfs.root, "then another format");
+        check(ranked.size() == 5 && ranked[4].root == full.root, "one too full last");
+        check(formatOf("VFAT") == Format::Good && formatOf("FAT32") == Format::Good && formatOf("exFAT") == Format::Warn &&
+                  formatOf("NTFS") == Format::Other && formatOf("ext4") == Format::Other && formatOf("") == Format::Other &&
+                  formatOf("fuseblk") == Format::Other,
+              "the formats");
+    }
+
+    void testLook(const fs::path &root)
+    {
+        Volume volume;
+        volume.root = root / "looked";
+        put(volume.root / "_NDS/TWiLightMenu/settings.ini");
+        lookAtVolume(volume);
+        check(volume.hasNds && volume.hasTwilight, "a console's card is seen for what it is");
+    }
+
+    void testCopy(const fs::path &root)
+    {
+        const fs::path data = root / "cache/_nds/hl_nds/data";
+        const fs::path card = root / "card";
+        const fs::path out = card / "_nds/hl_nds/data";
+        put(data / "manifest.bin", "new list");
+        put(data / "common.npac", "common");
+        put(data / "maps/a.npac", "aaaa");
+        put(data / "air/a.hgs", "stream");
+        put(data / "saves/stray.sav", "never");
+        put(data / "settings.dat", "never");
+        put(data / "server.ini", "never");
+        put(data / "maps/b.npac.tmp12", "half written");
+        put(root / "half-life-nds-port.nds", "rom");
+        // What the player has, and an old install.
+        put(out / "saves/auto.sav", "mine");
+        put(out / "settings.dat", "my settings");
+        put(out / "achievements.dat", "mine too");
+        put(out / "server.ini", "host = mine");
+        put(out / "manifest.bin", "old list");
+        put(out / "maps/old.npac", "old map");
+        put(out / "common.npac", "common");
+
+        CopyPlan plan = planCopy(data, root / "half-life-nds-port.nds", card);
+        check(plan.same == 1, "what is there already is not copied");
+        check(!plan.copy.empty() && plan.copy.back().to.filename() == "manifest.bin", "the list of maps last");
+        check(plan.remove.size() == 1 && plan.remove[0].filename() == "old.npac", "a map no longer wanted goes");
+
+        // Cancelled at once: nothing in place, and the old list still rules.
+        std::atomic<bool> stop{true};
+        std::string why;
+        check(!runCopy(plan, nullptr, &stop, why), "a cancelled copy says so");
+        check(read(out / "manifest.bin") == "old list", "... the old list still there");
+
+        plan = planCopy(data, root / "half-life-nds-port.nds", card);
+        std::uint64_t seen = 0;
+        check(runCopy(plan, [&](std::uint64_t done, std::uint64_t, const std::string &) { seen = done; }, nullptr, why), "it finishes");
+        check(seen == plan.bytes, "every byte said");
+        check(read(out / "manifest.bin") == "new list", "the new list");
+        check(read(out / "maps/a.npac") == "aaaa" && read(out / "air/a.hgs") == "stream", "the files");
+        check(read(card / "half-life-nds-port.nds") == "rom", "the program at the card's root");
+        check(!fs::exists(out / "maps/old.npac"), "the old map gone");
+        check(read(out / "saves/auto.sav") == "mine", "the player's save kept");
+        check(read(out / "settings.dat") == "my settings" && read(out / "achievements.dat") == "mine too", "... and settings");
+        check(read(out / "server.ini") == "host = mine", "... and the relay's address");
+        check(!fs::exists(out / "saves/stray.sav"), "none of the cache's");
+        check(!fs::exists(out / "manifest.bin.new"), "no temporary left");
+        check(!fs::exists(out / "maps/b.npac.tmp12"), "nor one a run left behind");
+
+        plan = planCopy(data, root / "half-life-nds-port.nds", card);
+        check(plan.copy.empty() && plan.remove.empty(), "the same again: nothing to do");
+
+        // No program to put there: the rest still goes.
+        plan = planCopy(data, root / "not-there.nds", root / "card2");
+        check(runCopy(plan, nullptr, nullptr, why) && fs::exists(root / "card2/_nds/hl_nds/data/manifest.bin"), "without the program");
+        // A card that takes nothing.
+        put(root / "blocked", "a file, not a folder");
+        plan = planCopy(data, {}, root / "blocked");
+        check(!runCopy(plan, nullptr, nullptr, why) && !why.empty(), "a card that cannot be written says why");
+    }
+
+    /// The program built into the converter, put on a card: when it has
+    /// none, or another; not again when it has this one.
+    void testRomPut(const fs::path &root)
+    {
+        const std::uint8_t mine[] = {'r', 'o', 'm', 0, 255, 1};
+        const std::uint8_t newer[] = {'r', 'o', 'm', 0, 255, 2};
+        const fs::path file = root / "card" / kRomName;
+        std::string why;
+        check(putRom(mine, file, why) == RomPut::Written && read(file) == std::string("rom\0\xff\1", 6),
+              "a card with no program is given it");
+        const auto when = fs::last_write_time(file);
+        check(putRom(mine, file, why) == RomPut::Same && fs::last_write_time(file) == when,
+              "... and not again when it has it");
+        check(putRom(newer, file, why) == RomPut::Written && read(file) == std::string("rom\0\xff\2", 6),
+              "another (an older one) is replaced");
+        put(file, "short");
+        check(putRom(mine, file, why) == RomPut::Written && read(file).size() == 6, "... whatever its size");
+        check(!fs::exists(root / "card" / (std::string(kRomName) + ".new")), "no temporary left");
+        put(root / "blocked", "a file, not a folder");
+        check(putRom(mine, root / "blocked" / kRomName, why) == RomPut::Failed && !why.empty(),
+              "a card that cannot be written says why");
+    }
+
+    /// The header's check, worked out here again (the DS's CRC-16: 0xA001
+    /// reflected, from 0xFFFF), apart from the converter's.
+    std::uint16_t crcHere(const std::uint8_t *bytes, std::size_t size)
+    {
+        std::uint16_t crc = 0xFFFF;
+        for (std::size_t i = 0; i < size; ++i)
+        {
+            crc = static_cast<std::uint16_t>(crc ^ bytes[i]);
+            for (int b = 0; b < 8; ++b)
+                crc = static_cast<std::uint16_t>((crc >> 1) ^ ((crc & 1) ? 0xA001 : 0));
+        }
+        return crc;
+    }
+
+    /// A program's beginning as the build makes it: its code, its version,
+    /// the rest of the header made up, and the check right.
+    std::vector<std::uint8_t> madeUpRom(const char *code)
+    {
+        std::vector<std::uint8_t> rom(0x4000);
+        for (std::size_t i = 0; i < rom.size(); ++i)
+            rom[i] = static_cast<std::uint8_t>(i * 7 + 3);
+        std::memcpy(rom.data(), "HALF-LIFE DS", 12);
+        std::memcpy(rom.data() + kGameCodeAt, code, 4);
+        rom[0x1E] = 0x57;
+        const std::uint16_t crc = crcHere(rom.data(), kHeaderCrcAt);
+        rom[kHeaderCrcAt] = static_cast<std::uint8_t>(crc);
+        rom[kHeaderCrcAt + 1] = static_cast<std::uint8_t>(crc >> 8);
+        return rom;
+    }
+
+    /// The program made for each console: its code, and the check right.
+    void testRomFor(const fs::path &root)
+    {
+        const std::uint8_t digits[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+        check(headerCrc(digits) == 0x4B37, "the header's check is CRC-16/MODBUS (\"123456789\": 4B37)");
+
+        const std::vector<std::uint8_t> built = madeUpRom("WHLD");
+        std::string why;
+        const struct
+        {
+            Device device;
+            const char *code;
+        } kWant[] = {{Device::ThreeDs, "WHLD"}, {Device::Dsi, "####"}, {Device::Ds, "####"}, {Device::Emulator, "####"}};
+        for (const auto &want : kWant)
+        {
+            std::vector<std::uint8_t> made;
+            const bool ok = romFor(built, want.device, made, why);
+            const std::uint16_t crc = static_cast<std::uint16_t>(made.size() > kHeaderCrcAt + 1
+                                                                     ? made[kHeaderCrcAt] | made[kHeaderCrcAt + 1] << 8
+                                                                     : 0);
+            bool rest = made.size() == built.size();
+            for (std::size_t i = 0; rest && i < built.size(); ++i)
+                rest = (i >= kGameCodeAt && i < kGameCodeAt + 4) || i == kHeaderCrcAt || i == kHeaderCrcAt + 1 ||
+                       made[i] == built[i];
+            const std::string message = std::string("for ") + deviceName(want.device) + ": code " + want.code +
+                                        ", the header's check right, and nothing else changed";
+            check(ok && std::memcmp(made.data() + kGameCodeAt, want.code, 4) == 0 &&
+                      crc == crcHere(made.data(), kHeaderCrcAt) && rest && made[0x1E] == 0x57,
+                  message.c_str());
+        }
+        // Back again: made from one already made for another.
+        std::vector<std::uint8_t> homebrew, wide;
+        check(romFor(built, Device::Emulator, homebrew, why) && romFor(homebrew, Device::ThreeDs, wide, why) &&
+                  wide == built,
+              "made for an emulator, then for a 3DS: the program as it was built");
+
+        // Not this game's.
+        std::vector<std::uint8_t> out;
+        std::vector<std::uint8_t> other = madeUpRom("ABCD");
+        check(!romFor(other, Device::Ds, out, why) && why.find("ABCD") != std::string::npos,
+              "another game's program is refused, saying its code");
+        std::vector<std::uint8_t> broken = built;
+        broken[0x20] ^= 1;
+        check(!romFor(broken, Device::Ds, out, why) && !why.empty(), "... and one whose header's check is wrong");
+        const std::vector<std::uint8_t> shortOne(0x100, 0);
+        check(!romFor(shortOne, Device::Ds, out, why) && !why.empty(), "... and one too short to be one");
+
+        // Names.
+        bool names = true;
+        for (const auto &want : kWant)
+        {
+            Device back = Device::Ds;
+            names = names && deviceFromName(deviceName(want.device), back) && back == want.device;
+        }
+        Device none = Device::Dsi;
+        check(names && !deviceFromName("wii", none) && none == Device::Dsi && kDefaultDevice == Device::Ds,
+              "each console by its name (dsi, 3ds, ds, emulator), no other; ds when not told");
+
+        // On the card: made for another console, it is written again.
+        const fs::path file = root / "card" / kRomName;
+        std::vector<std::uint8_t> forDs, for3ds;
+        romFor(built, Device::Ds, forDs, why);
+        romFor(built, Device::ThreeDs, for3ds, why);
+        check(putRom(forDs, file, why) == RomPut::Written && putRom(forDs, file, why) == RomPut::Same &&
+                  putRom(for3ds, file, why) == RomPut::Written && read(file).compare(kGameCodeAt, 4, "WHLD") == 0,
+              "a card's program made for another console is written again, not left as it was");
+    }
+
+    /// Where the relay is: written when the card has nothing, never over
+    /// what it has.
+    void testServerIni(const fs::path &root)
+    {
+        const fs::path file = root / "card" / "_nds" / "hl_nds" / "data" / "server.ini";
+        std::string why;
+        const std::string want = std::string("host = ") + kRelayHost + "\nport = " + std::to_string(kRelayPort) + "\n";
+        check(putServerIni(root / "card", why) == IniPut::Written && read(file).find(want) != std::string::npos,
+              "a card with no server.ini is given the project's relay");
+        put(file, "host = my.own.relay\n");
+        check(putServerIni(root / "card", why) == IniPut::Kept && read(file) == "host = my.own.relay\n",
+              "... and one that says another relay is kept as it is");
+        put(root / "blocked", "a file, not a folder");
+        check(putServerIni(root / "blocked", why) == IniPut::Failed && !why.empty(), "a card that cannot be written says why");
+    }
+
+    /// Where the stage goes when it is not said: never in the folder the
+    /// converter is run from, nor beside a card at a root; beside the card
+    /// only if a stage is there already.
+    void testStage(const fs::path &root)
+    {
+        const fs::path cache = root / "cache";
+        bool kept = true;
+        const fs::path relative = defaultStage("hlds", cache, kept);
+        check(!kept && relative.parent_path() == cache / "hlds-convert" &&
+                  relative.filename().string().rfind("stage-", 0) == 0,
+              "a card given as a folder of the working folder: its stage in the user's cache, not beside it");
+        check(defaultStage("hlds", cache, kept) == relative, "... the same one each run (the next run finds it)");
+        check(defaultStage(root / "another", cache, kept) != relative, "... and another card has another");
+        const fs::path top = defaultStage(root.root_path(), cache, kept);
+        check(!kept && top.parent_path() == cache / "hlds-convert",
+              "a card at a drive's or mount's root: its stage in the cache, not beside the root");
+
+        // A card converted before, its stage beside it: carried on with.
+        const fs::path card = root / "card";
+        put(root / "card-stage" / "_nds" / "hl_nds" / "data" / "manifest.bin");
+        check(defaultStage(card, cache, kept) == root / "card-stage" && kept,
+              "a card whose stage is beside it already keeps it there");
+        check(defaultStage(root / "card" / "", cache, kept) == root / "card-stage" && kept, "... given with a slash at its end too");
+        check(defaultStage(root / "fresh", fs::path(), kept) == root / "fresh-stage" && !kept,
+              "no cache folder on this system: beside the card, as before");
+        check(!userCacheFolder().empty(), "this system says where its user's cache is");
+    }
+
+    void testParts()
+    {
+        check(partOfMap("t0a0b1") == Part::HazardCourse, "Hazard Course");
+        check(partOfMap("hldemo2") == Part::Uplink, "Uplink");
+        check(partOfMap("stalkyard") == Part::Multiplayer && partOfMap("crossfire") == Part::Multiplayer, "multiplayer");
+        check(partOfMap("c1a0") == Part::Campaign && partOfMap("c0a0e") == Part::Campaign, "campaign");
+        const std::uint64_t mb = 1024 * 1024;
+        check(spaceFor(125) > 600 * mb && spaceFor(125) < 800 * mb, "the whole game's size");
+    }
+} // namespace
+
+namespace
+{
+    // Counter-Strike 1.6 DS's ROM: the hashes its header is checked with,
+    // the icon, the game gathered, and a ROM made from a small program.
+    void testCsRom(const fs::path &root)
+    {
+        auto hex = [](const std::array<std::uint8_t, 20> &d)
+        {
+            std::string s;
+            char b[3];
+            for (const std::uint8_t v : d)
+            {
+                std::snprintf(b, sizeof(b), "%02x", v);
+                s += b;
+            }
+            return s;
+        };
+        const std::string abc = "abc";
+        check(hex(sha1(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t *>(abc.data()), abc.size()))) ==
+                  "a9993e364706816aba3e25717850c26c9cd0d89d",
+              "SHA-1 of abc");
+        const std::vector<std::uint8_t> key(20, 0x0B);
+        const std::string hi = "Hi There";
+        check(hex(hmacSha1(key, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t *>(hi.data()), hi.size()))) ==
+                  "b617318655057264e28bc0b6fb378c8ef146be00",
+              "HMAC-SHA1, RFC 2202's first");
+
+        // One colour: all of the icon it, in the first colour after see-through.
+        std::array<std::uint8_t, 32 * 32 * 3> red{};
+        for (int i = 0; i < 32 * 32; ++i)
+            red[i * 3] = 255;
+        const BannerIcon icon = iconFromRgb(red);
+        check(icon.palette[1] == 0x001F && icon.tiles[0] == 0x11 && icon.tiles[511] == 0x11, "an icon of one colour");
+
+        // A converted Counter-Strike: what the game reads of it, and not more.
+        const fs::path data = root / "cstrike";
+        put(data / "common.npac", "common");
+        put(data / "manifest.bin", "manifest");
+        put(data / "maps" / "de_dust2.npac", "dust2");
+        put(data / "maps" / "de_dust2.npac.tmp123", "half");
+        put(data / "saves" / "slot1.sav", "saved");
+        std::vector<RomFile> files;
+        std::string why;
+        check(gatherCsGame(data, files, why) && files.size() == 3 && files[2].path == "data/cstrike/maps/de_dust2.npac",
+              "the converted game gathered, without a save or a temporary");
+        std::vector<RomFile> none;
+        check(!gatherCsGame(root / "nothing", none, why), "no converted game: said");
+
+        // Who has only Counter-Strike: Half-Life's files without its maps,
+        // and Counter-Strike beside them -- found.
+        {
+            const fs::path half = root / "steam" / "Half-Life";
+            put(half / "valve" / "liblist.gam", "game \"Half-Life\"");
+            put(half / "cstrike" / "liblist.gam", "game \"Counter-Strike\"");
+            put(half / "cstrike" / "maps" / "de_dust2.bsp", "bsp");
+            const GameFolder found = checkGame(half);
+            check(found.ok && found.maps == 1 && found.valve.filename() == "valve", "Counter-Strike alone: found");
+            const GameFolder bare = checkGame(root / "steam");
+            check(bare.ok, "... from the folder above too");
+        }
+
+        // A program of nothing but a header, its file system and banner.
+        std::vector<std::uint8_t> base(0x5000, 0);
+        auto p32 = [&](std::size_t at, std::uint32_t v)
+        {
+            for (int i = 0; i < 4; ++i)
+                base[at + i] = static_cast<std::uint8_t>(v >> (8 * i));
+        };
+        std::memcpy(base.data() + kGameCodeAt, "####", 4);
+        p32(0x30, 0x4000); // ARM7
+        p32(0x3C, 0x10);
+        p32(0x40, 0x4200); // file names: the root, empty
+        p32(0x44, 9);
+        p32(0x46, 0); // (its folders: one)
+        base[0x4206] = 1;
+        p32(0x48, 0x4400); // the file table: none
+        p32(0x4C, 0);
+        p32(0x68, 0x4600); // banner
+        base[0x4600] = 1;
+        const std::uint16_t crc = headerCrc(std::span<const std::uint8_t>(base).first(kHeaderCrcAt));
+        base[kHeaderCrcAt] = static_cast<std::uint8_t>(crc);
+        base[kHeaderCrcAt + 1] = static_cast<std::uint8_t>(crc >> 8);
+        CsRomLook look;
+        std::vector<std::uint8_t> rom;
+        const bool made = buildCsRom(base, files, look, Device::ThreeDs, rom, why);
+        check(made, "a ROM made");
+        if (!made)
+        {
+            std::printf("  (%s)\n", why.c_str());
+            return;
+        }
+        std::vector<RomFileAt> at;
+        check(romFiles(rom, at, why) && at.size() == 3, "its files read back");
+        bool same = at.size() == 3;
+        for (std::size_t i = 0; same && i < 3; ++i)
+        {
+            const RomFile *want = nullptr;
+            for (const RomFile &f : files)
+                if (f.path == at[i].path)
+                    want = &f;
+            same = want != nullptr && want->bytes.size() == at[i].size &&
+                   std::equal(want->bytes.begin(), want->bytes.end(), rom.begin() + at[i].offset);
+        }
+        check(same, "... each as it was given");
+        check(std::memcmp(rom.data() + kGameCodeAt, "WCSD", 4) == 0, "for a 3DS: WCSD");
+        check(headerCrc(std::span<const std::uint8_t>(rom).first(kHeaderCrcAt)) ==
+                  static_cast<std::uint16_t>(rom[kHeaderCrcAt] | rom[kHeaderCrcAt + 1] << 8),
+              "its header's check right");
+        const std::uint32_t banner = rom[0x68] | rom[0x69] << 8 | rom[0x6A] << 16 | static_cast<std::uint32_t>(rom[0x6B]) << 24;
+        check(rom[banner + 0x240] == 'C' && rom[banner + 0x242] == 'o', "named Counter-Strike 1.6 DS");
+        std::vector<RomFile> twice = files;
+        twice.push_back(files[0]);
+        check(!buildCsRom(base, twice, look, Device::Ds, rom, why), "a file twice: refused");
+        check(!buildCsRom(std::span<const std::uint8_t>(base).first(0x100), files, look, Device::Ds, rom, why),
+              "not a program: refused");
+        // The installer's: none of the game in it (read from the card), only
+        // its name and picture.
+        std::vector<RomFileAt> bareFiles, baseFiles;
+        const bool bare = buildCsRom(base, {}, look, Device::Ds, rom, why);
+        check(bare && romFiles(rom, bareFiles, why) && romFiles(base, baseFiles, why) && bareFiles.size() == baseFiles.size(),
+              "a ROM with none of the game: the program's own files only");
+        const std::uint32_t bareBanner = rom[0x68] | rom[0x69] << 8 | rom[0x6A] << 16 | static_cast<std::uint32_t>(rom[0x6B]) << 24;
+        check(bare && rom[bareBanner + 0x240] == 'C', "... named Counter-Strike 1.6 DS");
+    }
+} // namespace
+
+int main()
+{
+    const fs::path root = fs::temp_directory_path() / "hlds_test_install";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    testVdf();
+    testGame(root / "g");
+    testFind(root / "f");
+    testVolumes();
+    testLook(root);
+    testCopy(root / "c");
+    testRomPut(root / "r");
+    testRomFor(root / "h");
+    testServerIni(root / "s");
+    testStage(root / "st");
+    testParts();
+    testCsRom(root / "cs");
+    fs::remove_all(root, ec);
+    if (failures == 0)
+        std::printf("test_install: ok\n");
+    return failures == 0 ? 0 : 1;
+}

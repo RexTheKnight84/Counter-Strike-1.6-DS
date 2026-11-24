@@ -1,0 +1,1122 @@
+#include "Guard.hpp"
+#include "Overlay.hpp"
+#include "game/Think.hpp"
+
+#include <cerrno>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <new>
+
+#include <nds.h>
+#include <nds/cpu_asm.h>
+
+// A release build says so, for tools/arm9-report.sh --check: only a release
+// is held to kDsMapHeap's margin (shared/HlDsRoom.hpp). A build that
+// profiles, measures, debugs or dumps is bigger by what it does, and only
+// says its margin.
+#if !defined(HLDS_PROFILE) && !defined(HLDS_ITCM_OFF) && !defined(HLDS_DEBUG_BUILD) && !defined(HLDS_BOX_TEST) && \
+    !defined(HLDS_VOICE_DUMP) && !defined(HLDS_DEV)
+extern "C" __attribute__((used)) const char hlReleaseBuild = 1; // (kept by build.py's --undefined)
+#endif
+
+// (The linker sends every call of the program's -- and, by GameDll's
+// resolver, the game library's -- to malloc and the rest here, to the
+// __wrap_ functions: build.py's --wrap. __real_ ones are the allocator's.)
+
+extern "C"
+{
+    void *__real_malloc(std::size_t size);
+    void __real_free(void *p);
+    void *__real_memalign(std::size_t align, std::size_t size);
+    void *__real_calloc(std::size_t count, std::size_t size);
+    void *__real_realloc(void *p, std::size_t size);
+    std::size_t malloc_usable_size(void *p);
+
+    // libnds's own, for the crash screen (not in its headers).
+    extern const char *exceptionMsg;
+    std::uint32_t getExceptionAddress(std::uint32_t opcodeAddress, std::uint32_t thumbState);
+
+    // The linker's marks.
+    extern char __text_start[], __text_end[], __dtcm_start[], __sp_usr[];
+}
+
+namespace hlrt::guard
+{
+    namespace
+    {
+        // ---- the heap's counts (both builds)
+
+        std::uint32_t blocks = 0, bytes = 0;
+        /// The most `bytes` has been since markPlay(), and what it was then.
+        std::uint32_t playBase = 0, playPeak = 0;
+
+#ifndef HLDS_GUARD_FULL
+        /// A block of the allocator's taken (+1) or given back (-1): what it
+        /// holds, as the allocator says.
+        void counted(void *p, int way)
+        {
+            const std::uint32_t n = static_cast<std::uint32_t>(malloc_usable_size(p));
+            const int saved = enterCriticalSection();
+            if (way > 0)
+            {
+                ++blocks;
+                bytes += n;
+                if (bytes > playPeak)
+                    playPeak = bytes;
+            }
+            else
+            {
+                --blocks;
+                bytes -= n;
+            }
+            leaveCriticalSection(saved);
+        }
+#endif
+
+        // ---- the allocator's chain (both builds)
+        //
+        // libnds's dlmalloc (built without FOOTERS): every chunk is a word
+        // before it (the size of the one before, when that one is free) and a
+        // word that is its own size with two bits: 1, the one before is in
+        // use; 2, this one is. The chunks follow one another from the heap's
+        // start (rounded so that what a chunk holds is on eight) to the top
+        // chunk, the free room at the end, and after it a last false chunk
+        // whose size takes it exactly to sbrk's end. A write past a block's
+        // end lands on the next chunk's size: the chain no longer adds up, or
+        // its bits disagree. Nothing is added to a block for it.
+        struct ChainWalk
+        {
+            std::uint32_t bad = 0;          ///< the chunk where it went wrong, or 0
+            std::uint32_t badHead = 0;      ///< ... its size word
+            std::uint32_t before = 0;       ///< ... the chunk before it
+            std::uint32_t topFree = 0;      ///< the top chunk
+            std::uint32_t largestHole = 0;  ///< the largest free chunk inside, what it can hold
+            std::uint32_t inHoles = 0;      ///< ... all of them
+        };
+
+        ChainWalk walkChain()
+        {
+            ChainWalk w;
+            const std::uint32_t start = reinterpret_cast<std::uint32_t>(getHeapStart());
+            const std::uint32_t end = reinterpret_cast<std::uint32_t>(getHeapEnd());
+            if (end <= start + 64)
+                return w; // (nothing taken yet)
+            auto word = [](std::uint32_t a) { return *reinterpret_cast<const volatile std::uint32_t *>(a); };
+            // The false chunk at the end: its size takes it to sbrk's end.
+            auto isLast = [&](std::uint32_t c) {
+                if (c + 8 > end)
+                    return false;
+                const std::uint32_t head = word(c + 4);
+                return (head & 3) == 0 && c + (head & ~7u) == end;
+            };
+            std::uint32_t c = start + ((8 - ((start + 8) & 7)) & 7);
+            std::uint32_t before = 0;
+            bool beforeFree = false;
+            std::uint32_t lastFree = 0;
+            auto fail = [&](std::uint32_t at) {
+                w.bad = at;
+                w.badHead = at + 8 <= end ? word(at + 4) : 0;
+                w.before = before;
+                return w;
+            };
+            while (true)
+            {
+                if (c + 8 > end || (c & 7) != 0)
+                    return fail(c);
+                if (isLast(c))
+                {
+                    // (What was before it is the top chunk: free.)
+                    if (!beforeFree)
+                        return fail(c);
+                    w.topFree = lastFree;
+                    // (Counted among the holes as it was met: not one.)
+                    w.inHoles -= lastFree > 4 ? lastFree - 4 : 0;
+                    return w;
+                }
+                const std::uint32_t head = word(c + 4);
+                const std::uint32_t size = head & ~7u;
+                const std::uint32_t next = c + size;
+                const bool lastNext = size >= 8 && next <= end && isLast(next);
+                if (size < (lastNext ? 8u : 16u) || next > end || ((head & 1) != 0) == beforeFree)
+                    return fail(c);
+                const bool free = (head & 2) == 0;
+                if (free)
+                {
+                    // (Two free chunks side by side are always made one;
+                    // and a free one's size is also in front of the next.)
+                    if (beforeFree || (!lastNext && word(next) != size))
+                        return fail(c);
+                    const std::uint32_t holds = size - 4;
+                    w.inHoles += holds;
+                    if (!lastNext && holds > w.largestHole)
+                        w.largestHole = holds;
+                    lastFree = size;
+                }
+                before = c;
+                beforeFree = free;
+                c = next;
+            }
+        }
+
+#ifdef HLDS_GUARD_FULL
+        // ---- the heap
+
+        constexpr std::uint32_t kLive = 0x4C495645;  // "LIVE"
+        constexpr std::uint32_t kGone = 0x474F4E45;  // "GONE": given back, held
+        constexpr std::uint8_t kTail[4] = {0x5A, 0xA5, 0xC3, 0x3C};
+        constexpr std::uint8_t kPoison = 0xDB;
+
+        /// In front of every block. (24 bytes: what malloc gives stays on
+        /// eight.)
+        struct Block
+        {
+            std::uint32_t magic;
+            std::uint32_t size;   ///< what was asked for
+            std::uint32_t caller; ///< the code that asked
+            std::uint16_t lead;   ///< from what the allocator gave to the block
+            std::uint16_t align;  ///< as asked (8: malloc's own)
+            Block *prev, *next;   ///< the blocks held (given back: who gave it back, in prev)
+        };
+        static_assert(sizeof(Block) == 24);
+
+        Block *first = nullptr;
+
+        /// Small blocks given back are held a while, filled: a write into
+        /// one is seen when it really goes (or at a check).
+        constexpr int kHeld = 64;
+        constexpr std::uint32_t kHeldMost = 4096;      ///< bytes of one block
+        constexpr std::uint32_t kHeldBytes = 32 * 1024; ///< ... of all of them
+        Block *held[kHeld];
+        int heldAt = 0, heldCount = 0;
+        std::uint32_t heldBytes = 0;
+
+        std::uint8_t *userOf(Block *b) { return reinterpret_cast<std::uint8_t *>(b) + sizeof(Block); }
+        Block *blockOf(void *p) { return reinterpret_cast<Block *>(static_cast<std::uint8_t *>(p) - sizeof(Block)); }
+        void *rawOf(Block *b) { return userOf(b) - b->lead; }
+
+        bool tailIntact(Block *b)
+        {
+            const std::uint8_t *t = userOf(b) + b->size;
+            return t[0] == kTail[0] && t[1] == kTail[1] && t[2] == kTail[2] && t[3] == kTail[3];
+        }
+
+        /// Where the first byte of a held block that is not the pattern is,
+        /// or -1.
+        int poisonBroken(Block *b)
+        {
+            const std::uint8_t *p = userOf(b);
+            for (std::uint32_t i = 0; i < b->size; ++i)
+            {
+                if (p[i] != kPoison)
+                    return static_cast<int>(i);
+            }
+            return -1;
+        }
+
+        /// A held block let go for good, its pattern looked at first.
+        void release(Block *b)
+        {
+            const int broken = poisonBroken(b);
+            if (broken >= 0)
+                crash("HEAP: written after it was freed", reinterpret_cast<std::uint32_t>(userOf(b)) + broken,
+                      b->size, b->caller);
+            heldBytes -= b->size;
+            b->magic = 0;
+            __real_free(rawOf(b));
+        }
+
+        void releaseOldest()
+        {
+            const int at = (heldAt - heldCount + kHeld) % kHeld;
+            Block *b = held[at];
+            held[at] = nullptr;
+            --heldCount;
+            release(b);
+        }
+
+        void releaseAll()
+        {
+            while (heldCount > 0)
+                releaseOldest();
+        }
+
+        void *take(std::size_t align, std::size_t size, std::uint32_t caller)
+        {
+            if (size > 0x0FFFFFFF)
+                return nullptr;
+            const std::size_t lead = align <= 8 ? sizeof(Block) : (sizeof(Block) + align - 1) & ~(align - 1);
+            const std::size_t whole = lead + size + sizeof(kTail);
+            const int saved = enterCriticalSection();
+            void *raw = align <= 8 ? __real_malloc(whole) : __real_memalign(align, whole);
+            if (raw == nullptr && heldCount > 0)
+            {
+                // (Short: what is held goes first.)
+                releaseAll();
+                raw = align <= 8 ? __real_malloc(whole) : __real_memalign(align, whole);
+            }
+            if (raw == nullptr)
+            {
+                leaveCriticalSection(saved);
+                return nullptr;
+            }
+            std::uint8_t *user = static_cast<std::uint8_t *>(raw) + lead;
+            Block *b = blockOf(user);
+            b->magic = kLive;
+            b->size = static_cast<std::uint32_t>(size);
+            b->caller = caller;
+            b->lead = static_cast<std::uint16_t>(lead);
+            b->align = static_cast<std::uint16_t>(align <= 8 ? 8 : align);
+            std::memcpy(user + size, kTail, sizeof(kTail));
+            b->prev = nullptr;
+            b->next = first;
+            if (first != nullptr)
+                first->prev = b;
+            first = b;
+            ++blocks;
+            bytes += b->size;
+            if (bytes > playPeak)
+                playPeak = bytes;
+            leaveCriticalSection(saved);
+            return user;
+        }
+
+        /// The block `p` is the user part of, checked; halts if it is not
+        /// one, or has been written past.
+        Block *checked(void *p, std::uint32_t caller)
+        {
+            Block *b = blockOf(p);
+            if (b->magic == kGone)
+                crash("HEAP: freed twice", reinterpret_cast<std::uint32_t>(p), b->size, caller);
+            if (b->magic != kLive)
+                crash("HEAP: freed, not a block", reinterpret_cast<std::uint32_t>(p), b->magic, caller);
+            if (!tailIntact(b))
+                crash("HEAP: written past its end", reinterpret_cast<std::uint32_t>(p), b->size, b->caller);
+            return b;
+        }
+
+        void give(void *p, std::uint32_t caller)
+        {
+            if (p == nullptr)
+                return;
+            const int saved = enterCriticalSection();
+            Block *b = checked(p, caller);
+            if (b->prev != nullptr)
+                b->prev->next = b->next;
+            else
+                first = b->next;
+            if (b->next != nullptr)
+                b->next->prev = b->prev;
+            --blocks;
+            bytes -= b->size;
+            if (b->size > kHeldMost)
+            {
+                b->magic = 0;
+                __real_free(rawOf(b));
+                leaveCriticalSection(saved);
+                return;
+            }
+            while (heldCount > 0 && (heldCount == kHeld || heldBytes + b->size > kHeldBytes))
+                releaseOldest();
+            b->magic = kGone;
+            b->prev = reinterpret_cast<Block *>(caller);
+            b->next = nullptr;
+            std::memset(userOf(b), kPoison, b->size);
+            held[heldAt] = b;
+            heldAt = (heldAt + 1) % kHeld;
+            ++heldCount;
+            heldBytes += b->size;
+            leaveCriticalSection(saved);
+        }
+
+#else
+        // ---- the heap, in a release build: the allocator's own blocks as
+        // they are (nothing added to them), counted. What is checked is the
+        // allocator's chain itself (allocatorBroken, below).
+
+        /// Kept back, and let go only when a block cannot be had otherwise:
+        /// the last room on a map that fills the heap. (The full guard has
+        /// its held blocks for that; without it, maps that start with them
+        /// stopped short for want of a few kilobytes.)
+        constexpr std::size_t kReserve = 32 * 1024;
+        void *reserve = nullptr;
+        /// When it was let go: in the load, or in play (perf.txt).
+        bool inPlay = false;
+        std::uint32_t letGoLoad = 0, letGoPlay = 0, letGoAsked = 0;
+
+#ifdef HLDS_HEAP_TRACE
+        // ---- the heap trace (Guard.hpp): 8 bytes in front of each block,
+        // and, for one aligned on more than 8, the same at the start of what
+        // the allocator gave (where a walk of its chain finds it).
+        constexpr std::uint32_t kTraceMagic = 0xC0DE0000u;
+        struct TraceHead
+        {
+            std::uint32_t caller;
+            std::uint32_t word; ///< kTraceMagic, then the lead's log2 (4 bits), then the generation (12 bits)
+        };
+        std::uint32_t generation = 1;
+        /// Set by operator new for the malloc it makes: whose it really is.
+        std::uint32_t pendingCaller = 0;
+        std::uint32_t loadStartLive = 0, loadPeakLive = 0, heapEndHigh = 0;
+        /// The last block that could not be had: its size and who asked.
+        std::uint32_t failSize = 0, failCaller = 0, failCount = 0;
+
+        bool traced(const void *at, TraceHead &h)
+        {
+            std::memcpy(&h, at, sizeof(h));
+            return (h.word & 0xFFFF0000u) == kTraceMagic;
+        }
+        std::uint32_t leadOf(const TraceHead &h) { return 1u << ((h.word >> 12) & 15); }
+#endif
+
+        void *take(std::size_t align, std::size_t size, std::uint32_t caller)
+        {
+#ifdef HLDS_HEAP_TRACE
+            if (pendingCaller != 0)
+            {
+                caller = pendingCaller;
+                pendingCaller = 0;
+            }
+            const std::size_t lead = align <= 8 ? 8 : align;
+            std::uint32_t log2 = 3;
+            while ((1u << log2) < lead)
+                ++log2;
+            const std::size_t whole = lead + size;
+#else
+            const std::size_t whole = size;
+            (void)caller;
+#endif
+            void *p = align <= 8 ? __real_malloc(whole) : __real_memalign(align, whole);
+            if (p == nullptr && reserve != nullptr)
+            {
+                __real_free(reserve);
+                reserve = nullptr;
+                ++(inPlay ? letGoPlay : letGoLoad);
+                letGoAsked = static_cast<std::uint32_t>(size);
+                p = align <= 8 ? __real_malloc(whole) : __real_memalign(align, whole);
+            }
+            if (p == nullptr)
+            {
+#ifdef HLDS_HEAP_TRACE
+                failSize = static_cast<std::uint32_t>(size);
+                failCaller = caller;
+                ++failCount;
+#endif
+                return nullptr;
+            }
+            counted(p, 1);
+#ifdef HLDS_HEAP_TRACE
+            const TraceHead h{caller, kTraceMagic | (log2 << 12) | (generation & 0xFFF)};
+            std::uint8_t *user = static_cast<std::uint8_t *>(p) + lead;
+            std::memcpy(user - sizeof(h), &h, sizeof(h));
+            if (lead > sizeof(h))
+                std::memcpy(p, &h, sizeof(h));
+            if (bytes > loadPeakLive)
+                loadPeakLive = bytes;
+            const std::uint32_t end = reinterpret_cast<std::uint32_t>(getHeapEnd());
+            if (end > heapEndHigh)
+                heapEndHigh = end;
+            return user;
+#else
+            return p;
+#endif
+        }
+
+        void give(void *p, std::uint32_t)
+        {
+            if (p == nullptr)
+                return;
+#ifdef HLDS_HEAP_TRACE
+            // (One the allocator gave someone else -- newlib's own, by its
+            // own names -- has no head: let go as it is.)
+            TraceHead h;
+            auto *user = static_cast<std::uint8_t *>(p);
+            if (traced(user - sizeof(h), h))
+            {
+                std::memset(user - sizeof(h), 0, sizeof(h));
+                p = user - leadOf(h);
+            }
+#endif
+            counted(p, -1);
+            __real_free(p);
+        }
+
+#ifdef HLDS_HEAP_TRACE
+        /// What a block holds for its user: what the allocator gave, less
+        /// the head (0: not one of ours).
+        std::uint32_t tracedUsable(void *user, std::uint32_t &align)
+        {
+            TraceHead h;
+            auto *u = static_cast<std::uint8_t *>(user);
+            if (!traced(u - sizeof(h), h))
+                return 0;
+            align = leadOf(h) <= 8 ? 8 : leadOf(h);
+            return static_cast<std::uint32_t>(malloc_usable_size(u - leadOf(h))) - leadOf(h);
+        }
+#endif
+#endif
+        std::uint32_t callerOf(void *returnAddress) { return reinterpret_cast<std::uint32_t>(returnAddress); }
+
+        // ---- the library and the stack
+
+        const std::uint8_t *libraryBase = nullptr;
+        std::uint32_t librarySize = 0, libraryCode = 0, librarySum = 0;
+
+        std::uint32_t sum(const std::uint8_t *p, std::uint32_t n)
+        {
+            const std::uint32_t *w = reinterpret_cast<const std::uint32_t *>(p);
+            std::uint32_t h = 0x811C9DC5;
+            for (std::uint32_t i = 0; i < n / 4; ++i)
+                h = (h ^ w[i]) * 0x01000193;
+            return h;
+        }
+
+        bool libraryIntact()
+        {
+            return libraryBase == nullptr || sum(libraryBase, libraryCode) == librarySum;
+        }
+
+        constexpr std::uint32_t kStackWords = 16;
+        constexpr std::uint32_t kStackMark = 0x5354414B; // "STAK"
+
+        /// The stack's last words: the bottom of DTCM. (The stack starts under
+        /// DTCM's own data, which sits at its top, and grows down from there;
+        /// past the bottom it would go on into main RAM.)
+        std::uint32_t *stackFloor()
+        {
+            return reinterpret_cast<std::uint32_t *>(__dtcm_start);
+        }
+
+        bool stackIntact()
+        {
+            const std::uint32_t *w = stackFloor();
+            for (std::uint32_t i = 0; i < kStackWords; ++i)
+            {
+                if (w[i] != (kStackMark ^ i))
+                    return false;
+            }
+            return true;
+        }
+
+#ifdef HLDS_GUARD_FULL
+        /// The first block whose header or end is wrong, or null.
+        Block *heapBroken()
+        {
+            std::uint32_t n = 0;
+            for (Block *b = first; b != nullptr; b = b->next)
+            {
+                if (b->magic != kLive || !tailIntact(b) || ++n > blocks)
+                    return b;
+            }
+            return nullptr;
+        }
+
+        Block *heldBroken()
+        {
+            for (int i = 0; i < kHeld; ++i)
+            {
+                if (held[i] != nullptr && (held[i]->magic != kGone || poisonBroken(held[i]) >= 0))
+                    return held[i];
+            }
+            return nullptr;
+        }
+
+#endif
+
+        // ---- the crash screen
+
+        void print(const char *s) { consolePrintString(s); }
+        void hex(std::uint32_t v) { consolePrintUnsigned(v, 16); }
+        void at(int x, int y) { consoleSetCursor(nullptr, x, y); }
+
+        constexpr const char kMain[] = "main";
+
+        /// What an address is: the program's code, the library's (how far
+        /// in), ITCM, an overlay's (by its name: how far into its region;
+        /// "ovl?" with none loaded there); or nothing.
+        const char *place(std::uint32_t a, std::uint32_t &offset)
+        {
+            offset = a;
+            if (a >= reinterpret_cast<std::uint32_t>(__text_start) && a < reinterpret_cast<std::uint32_t>(__text_end))
+                return kMain;
+            if (libraryBase != nullptr && a >= reinterpret_cast<std::uint32_t>(libraryBase) &&
+                a < reinterpret_cast<std::uint32_t>(libraryBase) + libraryCode)
+            {
+                offset = a - reinterpret_cast<std::uint32_t>(libraryBase);
+                return "dsl";
+            }
+            if (a >= 0x01000000 && a < 0x02000000)
+            {
+                offset = a & 0x7FFF;
+                return "itcm";
+            }
+            ovl::Id in = ovl::Id::None;
+            if (ovl::place(a, in, offset))
+                return in != ovl::Id::None ? ovl::name(in) : "ovl?";
+            offset = a;
+            return nullptr;
+        }
+
+        void placed(std::uint32_t a)
+        {
+            std::uint32_t offset = 0;
+            const char *where = place(a, offset);
+            hex(a);
+            if (where != nullptr && where != kMain)
+            {
+                print(" ");
+                print(where);
+                print("+");
+                hex(offset);
+            }
+            else if (where != nullptr)
+                print(" main");
+        }
+
+        [[noreturn]] void screen(const char *what, bool exception, const std::uint32_t *regs, std::uint32_t pc,
+                                 std::uint32_t addr, const std::uint32_t *numbers)
+        {
+            REG_IME = 0;
+            vramSetBankH(VRAM_H_LCD); // (the touch screen's: not over the console's)
+            consoleDemoInit();
+            BG_PALETTE_SUB[0] = RGB15(15, 0, 0);
+            BG_PALETTE_SUB[255] = RGB15(31, 31, 31);
+
+            at(0, 0);
+            print("CRASH ");
+            print(hlBuildId);
+            at(0, 1);
+            print(what);
+            at(0, 3);
+            print("pc ");
+            placed(pc);
+            if (exception)
+            {
+                at(0, 4);
+                print("ad ");
+                hex(addr);
+                print(" lr ");
+                placed(regs[14]);
+                static const char *const kNames[14] = {"r0", "r1", "r2", "r3", "r4", "r5", "r6",
+                                                       "r7", "r8", "r9", "rA", "rB", "rC", "sp"};
+                for (int i = 0; i < 14; ++i)
+                {
+                    at((i & 1) * 13, 6 + i / 2);
+                    print(kNames[i]);
+                    print(" ");
+                    hex(regs[i]);
+                }
+            }
+            else
+            {
+                static const char *const kWhat[3] = {"block ", "size  ", "by    "};
+                for (int i = 0; i < 3; ++i)
+                {
+                    at(0, 5 + i);
+                    print(kWhat[i]);
+                    if (i == 2)
+                        placed(numbers[i]);
+                    else
+                        hex(numbers[i]);
+                }
+                // A block of the heap's: the last of it, and what is past
+                // its end -- the 4 bytes that must stay, and on -- for what
+                // they look like (whose writing it is).
+                const std::uint32_t block = numbers[0], size = numbers[1];
+                if (block >= 0x02000000 && block < 0x03000000 && size < 0x01000000)
+                {
+                    static const char kDigits[] = "0123456789ABCDEF";
+                    auto bytes = [&](int row, const char *label, std::uint32_t from, int count)
+                    {
+                        at(0, row);
+                        print(label);
+                        char text[3] = {};
+                        for (int n = 0; n < count; ++n)
+                        {
+                            const std::uint8_t b = *reinterpret_cast<const volatile std::uint8_t *>(from + n);
+                            text[0] = kDigits[b >> 4];
+                            text[1] = kDigits[b & 15];
+                            print(text);
+                            print(n == 3 || n == 7 ? " " : "");
+                        }
+                    };
+                    bytes(9, "end-8 ", block + size - 8, 8);
+                    bytes(10, "end   ", block + size, 8);
+                    bytes(11, "end+8 ", block + size + 8, 8);
+                }
+            }
+            // Code addresses on the stack, nearest first: what called what,
+            // most likely.
+            at(0, 14);
+            print("stack:");
+            const std::uint32_t *sp = reinterpret_cast<const std::uint32_t *>(regs[13] & ~3u);
+            const std::uint32_t *top = reinterpret_cast<const std::uint32_t *>(__sp_usr);
+            // Two to a row; one with an offset (dsl+, front+) is too long for
+            // half of one, and has a row of its own.
+            int row = 15, column = 0;
+            for (const std::uint32_t *w = sp; w < top && w < sp + 1024 && row < 19; ++w)
+            {
+                std::uint32_t offset = 0;
+                const char *where = place(*w, offset);
+                if (where == nullptr)
+                    continue;
+                const bool wide = where != kMain;
+                if (wide && column != 0)
+                {
+                    column = 0;
+                    if (++row >= 19)
+                        break;
+                }
+                at(column * 16, row);
+                placed(*w);
+                if (wide || column == 1)
+                {
+                    column = 0;
+                    ++row;
+                }
+                else
+                    column = 1;
+            }
+            // The checks.
+#ifdef HLDS_GUARD_FULL
+            const bool heap = heapBroken() == nullptr && heldBroken() == nullptr && walkChain().bad == 0;
+#else
+            const bool heap = walkChain().bad == 0;
+#endif
+            at(0, 20);
+            print(heap ? "heap ok " : "heap BAD ");
+            print(libraryIntact() ? "dsl ok " : "dsl BAD ");
+            print(stackIntact() ? "stack ok" : "stack BAD");
+            at(0, 21);
+            print("dsl ");
+            hex(reinterpret_cast<std::uint32_t>(libraryBase));
+            print(" ");
+            hex(libraryCode);
+#if HL_OVL_REGION_COUNT > 0
+            // What each overlay region holds, and whether its code is as it
+            // was read (Overlay.hpp).
+            at(0, 22);
+            print("ovl");
+            for (int r = 0; r < HL_OVL_REGION_COUNT; ++r)
+            {
+                print(" ");
+                print(ovl::name(ovl::current(static_cast<ovl::Region>(r))));
+            }
+            print(ovl::whole() ? " ok" : " BAD");
+#endif
+            at(0, 23);
+            print("build/elf/<name>: addr2line");
+            for (;;)
+                swiWaitForVBlank();
+        }
+
+        [[noreturn]] void onException()
+        {
+            const std::uint32_t mode = getCPSR() & CPSR_MODE_MASK;
+            const std::uint32_t thumb = *(EXCEPTION_STACK_TOP - 3) & CPSR_FLAG_T;
+            std::uint32_t regs[16];
+            for (int i = 0; i < 16; ++i)
+                regs[i] = static_cast<std::uint32_t>(exceptionRegisters[i]);
+            const char *what = exceptionMsg;
+            std::uint32_t pc = 0, addr = 0;
+            if (what == nullptr && mode == CPSR_MODE_ABORT)
+            {
+                what = "Data abort";
+                pc = regs[15] - 8;
+                addr = place(pc, addr) != nullptr ? getExceptionAddress(pc, thumb) : pc;
+            }
+            else
+            {
+                if (what == nullptr)
+                    what = mode == CPSR_MODE_UNDEFINED ? "Undefined instruction" : "Unknown error";
+                pc = regs[15] - (thumb ? 2 : 4);
+                addr = pc;
+            }
+            screen(what, true, regs, pc, addr, nullptr);
+        }
+    } // namespace
+
+    // The program's statics are made without a lock (-fno-threadsafe-statics,
+    // source/StdHalts.cpp): right only while the threads take turns, never
+    // one cut off by another. libnds's switch for cutting them off at an
+    // interrupt (cothread_preemption_enable) is a flag of its own, not in its
+    // header: switched on, the game stops here, at once or within a frame.
+    // (Exported by libnds -- source/common/cothread/threads.c, read by its
+    // interrupt dispatcher -- but not in its header: an update of libnds may
+    // drop or rename it, and the link then fails here, which is as it should
+    // be: the check is then to be made again by the new name.)
+    extern "C" bool cothread_preemption_enabled;
+    static void checkTakingTurns()
+    {
+        if (cothread_preemption_enabled)
+            crash("THREADS: preemption is on; the statics have no lock");
+    }
+
+    void install()
+    {
+        std::uint32_t *w = stackFloor();
+        for (std::uint32_t i = 0; i < kStackWords; ++i)
+            w[i] = kStackMark ^ i;
+        setExceptionHandler(onException);
+        checkTakingTurns();
+    }
+
+    void noteLibrary(const void *base, std::uint32_t size, std::uint32_t codeBytes)
+    {
+        libraryBase = static_cast<const std::uint8_t *>(base);
+        librarySize = size;
+        libraryCode = codeBytes < size ? codeBytes : size;
+        librarySum = sum(libraryBase, libraryCode);
+    }
+
+    std::uint32_t *stackLimit() { return stackFloor() + kStackWords; }
+
+    void frame()
+    {
+        checkTakingTurns();
+        if (!stackIntact())
+            crash("STACK: overflowed (DTCM)", reinterpret_cast<std::uint32_t>(stackFloor()), kStackWords * 4);
+        if (const void *end = think.stackOverflowed())
+            crash("STACK: overflowed (thinking)", reinterpret_cast<std::uint32_t>(end), 64);
+    }
+
+    void check(const char *where)
+    {
+        frame();
+        const int saved = enterCriticalSection();
+#ifdef HLDS_GUARD_FULL
+        Block *bad = heapBroken();
+        if (bad != nullptr)
+            crash(bad->magic != kLive ? "HEAP: a block's header broken" : "HEAP: written past its end",
+                  reinterpret_cast<std::uint32_t>(userOf(bad)), bad->size, bad->caller);
+        bad = heldBroken();
+        if (bad != nullptr)
+            crash("HEAP: written after it was freed", reinterpret_cast<std::uint32_t>(userOf(bad)), bad->size,
+                  bad->caller);
+#endif
+        // (The block's address, the size word found there, the chunk
+        // before: whose end it was written past.)
+        const ChainWalk chain = walkChain();
+        if (chain.bad != 0)
+            crash("HEAP: the allocator's chain broken", chain.bad, chain.badHead, chain.before);
+        leaveCriticalSection(saved);
+        if (!libraryIntact())
+            crash("DSL: its code was written over", reinterpret_cast<std::uint32_t>(libraryBase), libraryCode,
+                  reinterpret_cast<std::uint32_t>(where));
+        // (The same of an overlay's code: the crash screen's ovl row says
+        // which.)
+        if (!ovl::whole())
+            crash("OVL: its code was written over", 0, 0, reinterpret_cast<std::uint32_t>(where));
+    }
+
+    void crash(const char *what, std::uint32_t a, std::uint32_t b, std::uint32_t c)
+    {
+        std::uint32_t regs[16] = {};
+        regs[13] = reinterpret_cast<std::uint32_t>(__builtin_frame_address(0));
+        const std::uint32_t numbers[3] = {a, b, c};
+        screen(what, false, regs, callerOf(__builtin_return_address(0)), 0, numbers);
+    }
+
+    std::uint32_t liveBlocks() { return blocks; }
+    std::uint32_t liveBytes() { return bytes; }
+
+#ifdef HLDS_HEAP_TRACE
+    void traceGeneration() { ++generation; }
+
+    void traceLoadBegin()
+    {
+        loadStartLive = loadPeakLive = bytes;
+        heapEndHigh = reinterpret_cast<std::uint32_t>(getHeapEnd());
+    }
+
+    void traceDump(void *outFile, const char *label, const char *map)
+    {
+        auto *out = static_cast<std::FILE *>(outFile);
+        // Every block in use, by a walk of the allocator's chain (as
+        // walkChain's): those of ours, by their heads; the rest apart.
+        struct Group
+        {
+            std::uint32_t gen, caller, count, bytes, highest;
+        };
+        constexpr int kGroups = 384;
+        static Group groups[kGroups];
+        int groupCount = 0, dropped = 0;
+        std::uint32_t older = 0, olderCount = 0, now = 0, nowCount = 0, other = 0, otherCount = 0;
+        const int saved = enterCriticalSection();
+        const std::uint32_t start = reinterpret_cast<std::uint32_t>(getHeapStart());
+        const std::uint32_t end = reinterpret_cast<std::uint32_t>(getHeapEnd());
+        const std::uint32_t reserveAt = reinterpret_cast<std::uint32_t>(reserve);
+        std::uint32_t c = start + ((8 - ((start + 8) & 7)) & 7);
+        while (end > start + 64 && c + 8 <= end)
+        {
+            const std::uint32_t head = *reinterpret_cast<const std::uint32_t *>(c + 4);
+            const std::uint32_t size = head & ~7u;
+            if (size < 8 || c + size > end)
+                break;
+            if (c + size == end && (head & 3) == 0)
+                break; // (the false last chunk)
+            if ((head & 2) != 0 && c + 8 != reserveAt)
+            {
+                TraceHead h;
+                const std::uint32_t holds = size - 4;
+                if (traced(reinterpret_cast<const void *>(c + 8), h))
+                {
+                    const std::uint32_t gen = h.word & 0xFFF;
+                    if (gen == (generation & 0xFFF))
+                    {
+                        now += holds;
+                        ++nowCount;
+                    }
+                    else
+                    {
+                        older += holds;
+                        ++olderCount;
+                    }
+                    // (This generation's too: a block of it can be what
+                    // parts the heap, put in a hole of the map before.)
+                    int g = 0;
+                    while (g < groupCount && (groups[g].gen != gen || groups[g].caller != h.caller))
+                        ++g;
+                    if (g == groupCount && groupCount < kGroups)
+                        groups[groupCount++] = Group{gen, h.caller, 0, 0, 0};
+                    if (g < groupCount)
+                    {
+                        ++groups[g].count;
+                        groups[g].bytes += holds;
+                        groups[g].highest = c + 8;
+                    }
+                    else
+                        ++dropped;
+                }
+                else
+                {
+                    other += holds;
+                    ++otherCount;
+                }
+            }
+            c += size;
+        }
+        leaveCriticalSection(saved);
+        if (out == nullptr)
+            return;
+        // (The largest first.)
+        for (int i = 1; i < groupCount; ++i)
+        {
+            const Group g = groups[i];
+            int j = i;
+            while (j > 0 && groups[j - 1].bytes < g.bytes)
+            {
+                groups[j] = groups[j - 1];
+                --j;
+            }
+            groups[j] = g;
+        }
+        std::fprintf(out,
+                     "trace: %s, %s: generation %lu; from older generations %lu bytes in %lu blocks, this one %lu "
+                     "in %lu, not ours (newlib's own) %lu in %lu; reserve %s\n",
+                     label, map, static_cast<unsigned long>(generation), static_cast<unsigned long>(older),
+                     static_cast<unsigned long>(olderCount), static_cast<unsigned long>(now),
+                     static_cast<unsigned long>(nowCount), static_cast<unsigned long>(other),
+                     static_cast<unsigned long>(otherCount), reserve != nullptr ? "held" : "let go");
+        for (int i = 0; i < groupCount && i < 80; ++i)
+            std::fprintf(out, "  gen %lu caller %08lx: %lu blocks, %lu bytes, the highest at %08lx\n",
+                         static_cast<unsigned long>(groups[i].gen), static_cast<unsigned long>(groups[i].caller),
+                         static_cast<unsigned long>(groups[i].count), static_cast<unsigned long>(groups[i].bytes),
+                         static_cast<unsigned long>(groups[i].highest));
+        if (groupCount > 80 || dropped > 0)
+            std::fprintf(out, "  (%d more groups, %d blocks past the table)\n", groupCount > 80 ? groupCount - 80 : 0,
+                         dropped);
+    }
+
+    void traceLoadEnd(void *outFile, const char *map, const char *how)
+    {
+        auto *out = static_cast<std::FILE *>(outFile);
+        if (out == nullptr)
+            return;
+        std::fprintf(out,
+                     "trace: load %s %s: live at its start %lu, at its peak %lu (+%lu), now %lu; heap's end at its "
+                     "highest %08lx, of a limit %08lx\n",
+                     map, how, static_cast<unsigned long>(loadStartLive), static_cast<unsigned long>(loadPeakLive),
+                     static_cast<unsigned long>(loadPeakLive - loadStartLive), static_cast<unsigned long>(bytes),
+                     static_cast<unsigned long>(heapEndHigh), reinterpret_cast<unsigned long>(getHeapLimit()));
+        if (failCount != 0)
+            std::fprintf(out, "trace: %lu blocks could not be had; the last %lu bytes, caller %08lx\n",
+                         static_cast<unsigned long>(failCount), static_cast<unsigned long>(failSize),
+                         static_cast<unsigned long>(failCaller));
+        // (The largest hole, then: whether the room was there, but in pieces.)
+        const ChainWalk chain = walkChain();
+        std::fprintf(out, "trace: free at the top %lu, in holes %lu, the largest hole %lu\n",
+                     static_cast<unsigned long>(chain.topFree), static_cast<unsigned long>(chain.inHoles),
+                     static_cast<unsigned long>(chain.largestHole));
+        failCount = 0;
+    }
+#endif
+
+    void renewReserve()
+    {
+#ifndef HLDS_GUARD_FULL
+        if (reserve == nullptr)
+            reserve = __real_malloc(kReserve);
+        inPlay = false;
+        letGoLoad = letGoPlay = letGoAsked = 0;
+#endif
+    }
+
+    ReserveState reserveState()
+    {
+        ReserveState state;
+#ifndef HLDS_GUARD_FULL
+        state.held = reserve != nullptr;
+        state.letGoLoad = letGoLoad;
+        state.letGoPlay = letGoPlay;
+        state.lastAsked = letGoAsked;
+#endif
+        return state;
+    }
+
+    void markPlay()
+    {
+#ifndef HLDS_GUARD_FULL
+        inPlay = true;
+#endif
+        const int saved = enterCriticalSection();
+        playBase = playPeak = bytes;
+        leaveCriticalSection(saved);
+    }
+
+    std::uint32_t playRise() { return playPeak - playBase; }
+
+    HeapRoom heapRoom()
+    {
+        // From the allocator's chain: the top is what sbrk has not given
+        // yet and the free top chunk below it, one piece; the holes are the
+        // free chunks inside.
+        const int saved = enterCriticalSection();
+        const ChainWalk chain = walkChain();
+        leaveCriticalSection(saved);
+        HeapRoom room;
+        room.top = static_cast<std::uint32_t>(getHeapLimit() - getHeapEnd());
+        if (chain.bad == 0)
+        {
+            room.top += chain.topFree > 4 ? chain.topFree - 4 : 0;
+            room.largestHole = chain.largestHole;
+            room.inHoles = chain.inHoles;
+        }
+        return room;
+    }
+} // namespace hlrt::guard
+
+// ---- what the linker sends malloc and the rest to
+
+extern "C"
+{
+    void *__wrap_malloc(std::size_t size)
+    {
+        return hlrt::guard::take(8, size, reinterpret_cast<std::uint32_t>(__builtin_return_address(0)));
+    }
+
+    void __wrap_free(void *p)
+    {
+        hlrt::guard::give(p, reinterpret_cast<std::uint32_t>(__builtin_return_address(0)));
+    }
+
+    void *__wrap_calloc(std::size_t count, std::size_t size)
+    {
+        if (size != 0 && count > 0x0FFFFFFF / size)
+            return nullptr;
+#if defined(HLDS_GUARD_FULL) || defined(HLDS_HEAP_TRACE)
+        void *p = hlrt::guard::take(8, count * size, reinterpret_cast<std::uint32_t>(__builtin_return_address(0)));
+        if (p != nullptr)
+            std::memset(p, 0, count * size);
+#else
+        void *p = __real_calloc(count, size);
+        if (p != nullptr)
+            hlrt::guard::counted(p, 1);
+#endif
+        return p;
+    }
+
+    void *__wrap_memalign(std::size_t align, std::size_t size)
+    {
+        if (align == 0 || (align & (align - 1)) != 0 || align > 0x8000)
+            return nullptr;
+        return hlrt::guard::take(align, size, reinterpret_cast<std::uint32_t>(__builtin_return_address(0)));
+    }
+
+    void *__wrap_aligned_alloc(std::size_t align, std::size_t size)
+    {
+        if (align == 0 || (align & (align - 1)) != 0 || align > 0x8000)
+            return nullptr;
+        return hlrt::guard::take(align, size, reinterpret_cast<std::uint32_t>(__builtin_return_address(0)));
+    }
+
+    int __wrap_posix_memalign(void **out, std::size_t align, std::size_t size)
+    {
+        if (align < sizeof(void *) || (align & (align - 1)) != 0 || align > 0x8000)
+            return EINVAL;
+        void *p = hlrt::guard::take(align, size, reinterpret_cast<std::uint32_t>(__builtin_return_address(0)));
+        if (p == nullptr)
+            return ENOMEM;
+        *out = p;
+        return 0;
+    }
+
+    void *__wrap_realloc(void *p, std::size_t size)
+    {
+        const std::uint32_t caller = reinterpret_cast<std::uint32_t>(__builtin_return_address(0));
+        if (p == nullptr)
+            return hlrt::guard::take(8, size, caller);
+        if (size == 0)
+        {
+            hlrt::guard::give(p, caller);
+            return nullptr;
+        }
+#ifdef HLDS_GUARD_FULL
+        const int saved = enterCriticalSection();
+        hlrt::guard::Block *b = hlrt::guard::checked(p, caller);
+        const std::uint32_t had = b->size, align = b->align;
+        leaveCriticalSection(saved);
+        void *q = hlrt::guard::take(align, size, caller);
+        if (q == nullptr)
+            return nullptr; // (the old block stays, as realloc's does)
+        std::memcpy(q, p, had < size ? had : size);
+        hlrt::guard::give(p, caller);
+        return q;
+#else
+#ifdef HLDS_HEAP_TRACE
+        // (One of ours: moved to a new block of ours, with its head.)
+        std::uint32_t align = 8;
+        if (const std::uint32_t had = hlrt::guard::tracedUsable(p, align))
+        {
+            void *q = hlrt::guard::take(align, size, caller);
+            if (q == nullptr)
+                return nullptr;
+            std::memcpy(q, p, had < size ? had : size);
+            hlrt::guard::give(p, caller);
+            return q;
+        }
+#endif
+        hlrt::guard::counted(p, -1);
+        void *q = __real_realloc(p, size);
+        hlrt::guard::counted(q != nullptr ? q : p, 1);
+        return q;
+#endif
+    }
+
+#ifdef HLDS_HEAP_TRACE
+    // operator new (build.py: --wrap, in a trace build): whose the block it
+    // asks malloc for really is.
+    void *__real__Znwj(std::size_t size);
+    void *__real__Znaj(std::size_t size);
+    void *__wrap__Znwj(std::size_t size)
+    {
+        hlrt::guard::pendingCaller = reinterpret_cast<std::uint32_t>(__builtin_return_address(0));
+        return __real__Znwj(size);
+    }
+    void *__wrap__Znaj(std::size_t size)
+    {
+        hlrt::guard::pendingCaller = reinterpret_cast<std::uint32_t>(__builtin_return_address(0));
+        return __real__Znaj(size);
+    }
+#endif
+}

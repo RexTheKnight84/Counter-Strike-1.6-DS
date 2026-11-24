@@ -1,0 +1,116 @@
+#pragma once
+
+// What keeps watch for memory going wrong, and what says so when it has.
+//
+// * The heap: every block the program asks for (malloc and the rest, the
+//   game library's too: GameDll's resolver) has a header -- its size, who
+//   asked for it -- and four bytes after its end that must stay as they
+//   were. A block given back is checked; small ones are kept back a while,
+//   filled with a pattern that must still be there when they really go. So
+//   a write past a block's end, or into one given back, is caught with the
+//   block's size and the address of the code that asked for it, instead of
+//   breaking the allocator's own lists to be found much later (a crash in
+//   free(), far from the culprit: 2026-10-28).
+// * The stack: the lowest words of its room (DTCM) hold a pattern, looked
+//   at every frame.
+// * The game library's code (hl.dsl): summed when it is loaded, and summed
+//   again at each map load and save, and on the crash screen.
+// * The crash screen (in place of libnds's): the build's name
+//   (tools/buildid.py; its ELFs are under build/elf/<name>/), where the
+//   fault was -- the program, the library and how far into it, or ITCM --
+//   the registers, the code addresses found on the stack, and the three
+//   checks above.
+
+#include <cstddef>
+#include <cstdint>
+
+namespace hlrt::guard
+{
+    /// At the start of main(): the crash screen, and the stack's pattern.
+    void install();
+    /// The game library, loaded at `base`, `size` bytes in all, of which the
+    /// first `codeBytes` never change once it is (its code and constants).
+    void noteLibrary(const void *base, std::uint32_t size, std::uint32_t codeBytes);
+    /// Every frame: the stack's pattern. Halts if it is gone.
+    void frame();
+    /// The first word of DTCM above the stack's pattern: the lowest the
+    /// stack may reach. (What paints the stack to measure it starts here,
+    /// or it paints the pattern over and is taken for an overflow.)
+    std::uint32_t *stackLimit();
+    /// Everything checked (heap, library, stack): halts on anything wrong.
+    /// `where`: what the game was doing, for the screen.
+    void check(const char *where);
+
+    /// Stops the game on the crash screen with `what` and up to three
+    /// numbers (a block, its size, who asked for it).
+    [[noreturn]] void crash(const char *what, std::uint32_t a = 0, std::uint32_t b = 0, std::uint32_t c = 0);
+
+    /// Blocks and bytes held (the debug readout).
+    std::uint32_t liveBlocks();
+    std::uint32_t liveBytes();
+
+    /// The heap trace (HLDS_HEAP_TRACE=1 ./make.sh, a debug build only):
+    /// every block has 8 bytes in front of it -- who asked for it (the
+    /// return address of the call to malloc or operator new) and the
+    /// generation it was taken in, one more at each map's load and as the
+    /// title is left for the game. traceDump writes the blocks still held
+    /// from before the generation now, by generation and caller, to `out`
+    /// (a FILE *); traceLoad* the heap's peak in a load. Without it, these
+    /// do nothing.
+#ifdef HLDS_HEAP_TRACE
+    void traceGeneration();
+    void traceLoadBegin();
+    void traceDump(void *out, const char *label, const char *map);
+    void traceLoadEnd(void *out, const char *map, const char *how);
+#else
+    inline void traceGeneration() {}
+    inline void traceLoadBegin() {}
+    inline void traceDump(void *, const char *, const char *) {}
+    inline void traceLoadEnd(void *, const char *, const char *) {}
+#endif
+
+    /// From now on, how far the heap's live bytes rise above what they are
+    /// now (playRise): what play takes on top of what a map's load left.
+    void markPlay();
+    /// At the start of a map's load, the old one gone: a release build's
+    /// last room taken back, if it was used (Guard.arm.cpp).
+    void renewReserve();
+    /// That room, since the map's load began: held still, and how many times
+    /// it was let go (in the load, in play) and for how big a block, the last
+    /// time. (A debug build has none: all zero.)
+    struct ReserveState
+    {
+        bool held = false;
+        std::uint32_t letGoLoad = 0;
+        std::uint32_t letGoPlay = 0;
+        std::uint32_t lastAsked = 0;
+    };
+    ReserveState reserveState();
+    std::uint32_t playRise();
+
+    /// Room in the heap: above its top, and in the holes inside it (the
+    /// largest one, and all of them). A walk of every block: for a map's
+    /// load, not for every frame.
+    struct HeapRoom
+    {
+        std::uint32_t top = 0;
+        std::uint32_t largestHole = 0;
+        std::uint32_t inHoles = 0;
+    };
+    HeapRoom heapRoom();
+} // namespace hlrt::guard
+
+extern "C"
+{
+    extern const char hlBuildId[]; // source/BuildId.gen.cpp (tools/buildid.py)
+    extern const char hlVersion[]; // ... and what the title shows
+
+    // The guarded heap, in place of malloc and the rest (build.py: --wrap).
+    void *__wrap_malloc(std::size_t size);
+    void __wrap_free(void *p);
+    void *__wrap_calloc(std::size_t count, std::size_t size);
+    void *__wrap_realloc(void *p, std::size_t size);
+    void *__wrap_memalign(std::size_t align, std::size_t size);
+    void *__wrap_aligned_alloc(std::size_t align, std::size_t size);
+    int __wrap_posix_memalign(void **out, std::size_t align, std::size_t size);
+}

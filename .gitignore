@@ -1,0 +1,125 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Linker files
+*.ilk
+
+# Debugger Files
+*.pdb
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+*.so.*
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Build directories
+build/
+Build/
+build-*/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+compile_commands.json
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+*.swp
+
+# vcpkg
+vcpkg_installed/
+
+# debug information files
+*.dwo
+
+# test output & cache
+Testing/
+.cache/
+
+# Build directories (architectds ROM build, CMake converter build)
+build/
+build-*/
+# Python venv created by setup-env.sh
+env/
+__pycache__/
+*.egg-info/
+# Reference material only, checked out to be read rather than built. None of it
+# is compiled into this project.
+helpSrc/
+# The CodeGraph index, rebuilt from the source.
+.codegraph/
+
+.claude/
+# architectds emits its ninja files at the repo root
+build.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Testing/
+.cache/
+# The ROM is a build artifact: ./make.sh produces it from this tree.
+*.nds
+*.sav
+# Local emulator SD card root. Holds converted game data, which must never be
+# committed: the converter makes it from the user's own copy of Half-Life.
+sdroot/
+# ... and the converter's own files beside it, which the card's archives are
+# made from (the stage: see README, "Converting the game").
+sdroot-stage/
+*.log
+
+# Made by tools/dspsim/embed.py from the DSP program
+source/audio/DspProgram.gen.cpp
+# Made by tools/buildid.py
+source/BuildId.gen.cpp
+
+# The Download Play child (child/build.py): its ROM and what a test build links in.
+child/out/
+child/generated/
+
+# The owner's TwlBg / TWL_FIRM dumps: Nintendo code, never committed
+tools/3ds/dumps/
+tools/3ds/twlbg-patcher/payload/feed.bin
+tools/3ds/twlbg-patcher/payload/feed.elf
+tools/3ds/twlbg-patcher/payload/feed.map
+tools/3ds/twlbg-patcher/payload/pass.bin
+tools/3ds/twlbg-patcher/payload/pass.elf
+
+# A ROM made with the player's own game in it (tools/cs16_rom.py,
+# build-cs16.ps1), and the game copied in for it: never committed.
+/local/
