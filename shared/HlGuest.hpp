@@ -138,7 +138,10 @@ namespace hldata
     // Raised 8 KB, to 93 KB over (23 Nov 2026): the smoke and the fire, the
     // grenades' kinds said in a match, the others seen in their side's model
     // (the child was 1512 KB at 85 over).
-    inline constexpr std::uint32_t kGuestImageBytes = 0x1646C8 + 93 * 1024;
+    // Raised 8 KB, to 101 KB over (23 Nov 2026): night vision, the shield,
+    // the silencers, the ammunition bought by the box, the bots' grenades
+    // (the child was 1522 KB at 93 over).
+    inline constexpr std::uint32_t kGuestImageBytes = 0x1646C8 + 101 * 1024;
     /// The heap's end: the end of main RAM less what the start-up code keeps.
     inline constexpr std::uint32_t kGuestRamBytes = 0x3F4000;
     /// What the engine holds beside a map's data -- its tables, the world's
