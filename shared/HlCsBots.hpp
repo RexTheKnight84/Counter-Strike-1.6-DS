@@ -755,6 +755,36 @@ namespace hldata::cs
         return grenadeEffect(w, state, kind, at, by);
     }
 
+    /// How a bot lobs its grenade from `from` to `to`: up to under what is
+    /// above their middle (500 units at most), and down onto it, under half
+    /// the world's pull -- the soldiers' toss (VecCheckToss), the bots' own
+    /// (none of the soldiers' code in the program). False: no way there.
+    inline bool botToss(LogicWorld &w, const PlayerState &player, const fx *from, const fx *to, fx *velocity)
+    {
+        const int gravity = fxToInt(gravityOf(player)) / 2;
+        if (to[2] - from[2] > fxFromInt(500) || gravity <= 0 || w.world == nullptr)
+            return false;
+        fx mid[3] = {(from[0] + to[0]) / 2, (from[1] + to[1]) / 2, (from[2] + to[2]) / 2};
+        const fx above[3] = {mid[0], mid[1], mid[2] + fxFromInt(500)};
+        const Shot up = traceShot(*w.world, mid, above);
+        mid[2] += static_cast<fx>((static_cast<std::int64_t>(fxFromInt(500)) * up.fraction) >> kFractionShift) - fxFromInt(15);
+        if (mid[2] < from[2] || mid[2] < to[2])
+            return false;
+        // (The time up and the time down, in ms: t = sqrt(d / (g / 2)).)
+        const std::int64_t t1 =
+            isqrt64(static_cast<std::uint64_t>(fxToInt(mid[2] - from[2])) * 2000000u / static_cast<std::uint32_t>(gravity));
+        const std::int64_t t2 =
+            isqrt64(static_cast<std::uint64_t>(fxToInt(mid[2] - to[2])) * 2000000u / static_cast<std::uint32_t>(gravity));
+        if (t1 < 100)
+            return false;
+        for (int k = 0; k < 2; ++k)
+            velocity[k] = static_cast<fx>((static_cast<std::int64_t>(to[k] - from[k]) * 1000) / (t1 + t2));
+        velocity[2] = static_cast<fx>((static_cast<std::int64_t>(fxFromInt(gravity)) * t1) / 1000);
+        const fx apex[3] = {from[0] + static_cast<fx>((static_cast<std::int64_t>(velocity[0]) * t1) / 1000),
+                            from[1] + static_cast<fx>((static_cast<std::int64_t>(velocity[1]) * t1) / 1000), mid[2]};
+        return lineClear(*w.world, from, apex) && lineClear(*w.world, to, apex);
+    }
+
     inline int botGrenadesThrown = 0; ///< (for the tests)
     /// A bot's grenade (`kind`) thrown from `from` at `velocity`: marked as
     /// the bot's, to go off as its kind. False: no room for it.
@@ -3043,7 +3073,7 @@ namespace hldata::cs
                             fx from[3] = {bot.pos[0], bot.pos[1], bot.pos[2] + fxFromInt(28)};
                             fx to[3] = {at[0], at[1], at[2]};
                             fx velocity[3];
-                            if (grunt::vecCheckToss(c, from, to, 50, velocity) &&
+                            if (botToss(w, player, from, to, velocity) &&
                                 botThrow(a, index, purse.grenade, from, velocity))
                             {
                                 purse.grenade = kGearNone;
