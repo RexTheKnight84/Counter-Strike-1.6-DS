@@ -91,6 +91,7 @@ It's a faithful remake on the original content, not the PC game running unchange
 - Adding new maps including cs_office, a mirage port, and an Ancient port from CS2
 - Bots should be able to pick up bomb after player drops it soon
 - Sub-factions such as the leet crew and arctic avengers being selectable
+- Online likely won't be a thing but it can be looked into more
 - Possible Valorant demake based off of this?
 
 ## Supported consoles
