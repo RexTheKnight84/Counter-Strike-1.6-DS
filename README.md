@@ -73,6 +73,8 @@ It's a faithful remake on the original content, not the PC game running unchange
 - Maps other than de_dust2, de_nuke and de_inferno have no bot routes yet.
 - Bullets don't go through walls yet.
 - Bots don't raise their shields.
+- Bomb cant be dropped yet
+- Sub-factions aren't implemented yet 
 - Online play: matches are local wireless only. A DS can't play against PC players.
 - Big servers: the DS's wireless allows a few consoles per match, not 32 players.
 
@@ -84,6 +86,12 @@ It's a faithful remake on the original content, not the PC game running unchange
   - Only de_dust2 fits in a receiving console's memory. de_nuke and de_inferno are too big to send.
   - In melonDS, the receiving console freezes after the transfer, because the emulated firmware checks the signature too.
   - A receiving DS in DS mode holds some guns as another of their kind (a Galil as the AK-47, for example). It has no shield models and no night vision sounds.
+
+## Future Version Plans:
+- Adding new maps including cs_office, a mirage port, and an Ancient port from CS2
+- Bots should be able to pick up bomb after player drops it soon
+- Sub-factions such as the leet crew and arctic avengers being selectable
+- Possible Valorant demake based off of this?
 
 ## Supported consoles
 
